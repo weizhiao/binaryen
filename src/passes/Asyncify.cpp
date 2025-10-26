@@ -328,9 +328,12 @@
 #include "pass.h"
 #include "passes/pass-utils.h"
 #include "support/file.h"
+#include "support/index.h"
 #include "support/string.h"
 #include "wasm-builder.h"
+#include "wasm-type.h"
 #include "wasm.h"
+#include <iostream>
 
 namespace wasm {
 
@@ -545,6 +548,8 @@ public:
                  bool canIndirectChangeState,
                  const String::Split& removeListInput,
                  const String::Split& addListInput,
+                 const String::Split& addIdxListInput,
+                 bool allDefFunctions,
                  bool propagateAddList,
                  const String::Split& onlyListInput,
                  bool verbose)
@@ -654,6 +659,23 @@ public:
         }
       });
 
+    if (allDefFunctions) {
+      for (auto& func : module.functions) {
+        if (func->imported()) {
+          continue;
+        }
+        auto& info = map[func.get()];
+        info.name = func->name;
+        if (verbose && !info.canChangeState) {
+          std::cout << "[asyncify] " << func->name
+                    << " can change the state due to all-def-functions\n";
+        }
+        info.addedFromList = true;
+        info.canChangeState = true;
+      }
+      return;
+    }
+
     // Functions in the remove-list are assumed to not change the state.
     for (auto& [func, info] : scanner.map) {
       if (removeList.match(func->name)) {
@@ -704,6 +726,25 @@ public:
             info.canChangeState = true;
             info.addedFromList = true;
           }
+        }
+      }
+      if (!addIdxListInput.empty()) {
+        // Process each index in the addIdxListInput
+        for (auto& indexStr : addIdxListInput) {
+          Index index = std::stoi(indexStr);
+          if (index >= module.functions.size()) {
+            std::cerr << "warning: Asyncify invalid function index: " << index
+                      << "\n";
+            continue;
+          }
+          auto func = module.functions[index].get();
+          auto& info = map[func];
+          if (verbose && !info.canChangeState) {
+            std::cout << "[asyncify] " << func->name
+                      << " is in the add-idx-list, add\n";
+          }
+          info.canChangeState = true;
+          info.addedFromList = true;
         }
       }
     };
@@ -1404,6 +1445,7 @@ struct AsyncifyLocals : public WalkerPass<PostWalker<AsyncifyLocals>> {
     walk(func->body);
     // After the normal function body, emit a barrier before the postamble.
     Expression* barrier;
+    auto module = getModule();
     if (func->getResults() == Type::none) {
       // The function may have ended without a return; ensure one.
       barrier = builder->makeReturn();
@@ -1416,6 +1458,11 @@ struct AsyncifyLocals : public WalkerPass<PostWalker<AsyncifyLocals>> {
     auto* newBody = builder->makeBlock(
       {builder->makeIf(builder->makeStateCheck(State::Rewinding),
                        makeLocalLoading()),
+       builder->makeIf(builder->makeStateCheck(State::Unwinding),
+                       func->getResults() == Type::none
+                         ? builder->makeReturn()
+                         : builder->makeReturn(LiteralUtils::makeZero(
+                             func->getResults(), *module))),
        builder->makeLocalSet(
          unwindIndex,
          builder->makeBlock(ASYNCIFY_UNWIND,
@@ -1426,7 +1473,7 @@ struct AsyncifyLocals : public WalkerPass<PostWalker<AsyncifyLocals>> {
       // If we unwind, we must still "return" a value, even if it will be
       // ignored on the outside.
       newBody->list.push_back(
-        LiteralUtils::makeZero(func->getResults(), *getModule()));
+        LiteralUtils::makeZero(func->getResults(), *module));
       newBody->finalize(func->getResults());
     }
     func->body = newBody;
@@ -1637,6 +1684,10 @@ struct Asyncify : public Pass {
     String::Split addList(String::trim(read_possible_response_file(
                             getArgumentOrDefault("asyncify-addlist", ""))),
                           String::Split::NewLineOr(","));
+    String::Split addIdxList(
+      String::trim(read_possible_response_file(
+        getArgumentOrDefault("asyncify-addidxlist", ""))),
+      String::Split::NewLineOr(","));
     std::string onlyListInput = getArgumentOrDefault("asyncify-onlylist", "");
     if (onlyListInput.empty()) {
       // Support old name for now to avoid immediate breakage TODO remove
@@ -1650,6 +1701,7 @@ struct Asyncify : public Pass {
     auto relocatable = hasArgument("asyncify-relocatable");
     auto secondaryMemory = hasArgument("asyncify-in-secondary-memory");
     auto propagateAddList = hasArgument("asyncify-propagate-addlist");
+    auto allDefFunctions = hasArgument("asyncify-all-def-functions");
 
     // Ensure there is a memory, as we need it.
 
@@ -1684,8 +1736,10 @@ struct Asyncify : public Pass {
     removeList = handleBracketingOperators(removeList);
     addList = handleBracketingOperators(addList);
     onlyList = handleBracketingOperators(onlyList);
+    addIdxList = handleBracketingOperators(addIdxList);
 
-    if (!onlyList.empty() && (!removeList.empty() || !addList.empty())) {
+    if (!onlyList.empty() && (!removeList.empty() || !addList.empty() ||
+                              allDefFunctions || !addIdxList.empty())) {
       Fatal() << "It makes no sense to use both an asyncify only-list together "
                  "with another list.";
     }
@@ -1709,6 +1763,8 @@ struct Asyncify : public Pass {
                             canIndirectChangeState,
                             removeList,
                             addList,
+                            addIdxList,
+                            allDefFunctions,
                             propagateAddList,
                             onlyList,
                             verbose);
